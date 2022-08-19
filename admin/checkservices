@@ -2,6 +2,8 @@
 
 # SPDX-License-Identifier: GPL-2.0
 
+#Edited to make it pacdiff independent by Martin Födinger
+
 # Copyright © Sébastien Luttringer
 #
 # This program is free software; you can redistribute it and/or
@@ -29,10 +31,13 @@ unset GREP_OPTIONS
 
 # systemd cgroup path
 if [[ -d /sys/fs/cgroup/systemd ]]; then
-  SYSTEMD_CGROUP_BASE_PATH='/sys/fs/cgroup/systemd'
+    SYSTEMD_CGROUP_BASE_PATH='/sys/fs/cgroup/systemd'
 else
-  SYSTEMD_CGROUP_BASE_PATH='/sys/fs/cgroup'
+    SYSTEMD_CGROUP_BASE_PATH='/sys/fs/cgroup'
 fi
+
+#Set Diff script through Environment Variable or default to rpmdiff
+diffscr=${DIFFSCRIPT:-'rpmdiff.sh'}
 
 # colors
 if [[ -t 1 ]]; then
@@ -48,7 +53,7 @@ fi
 AUTOCONFIRM=0       # autoconfirmation
 DBUS=1              # relauch when dbus
 FAILED=1            # display failed service at the end
-PACDIFF=1           # run pacdiff
+DODIFF=1            # run diff script
 RELOAD=1            # reload systemd
 RESTART=1           # restart services
 SERIALIZE=0         # run in parallel
@@ -77,7 +82,7 @@ in_array() {
     local needle=$1; shift
     local item
     for item in "$@"; do
-       [[ $item = $needle ]] && return 0 # Found
+        [[ $item = $needle ]] && return 0 # Found
     done
     return 1 # Not Found
 }
@@ -92,8 +97,8 @@ confirm() {
         printf '%s [Yes|No] ' "$1"
         read -r ans || return 1
         case $ans in
-            y|Y|yes|Yes) return 0;;
-            n|N|no|No) return 1;;
+        y|Y|yes|Yes) return 0;;
+        n|N|no|No) return 1;;
         esac
     done
     error "Too much invalid answer. Not confirmed."
@@ -111,7 +116,11 @@ get_broken_maps() {
     local -a pids=()
     local -i pid=0
     for service in $(get_services); do
-        unit_path="$(systemctl --property ControlGroup --value show "$service")"
+        # --value wasn't supported in my CentOS install yet
+        #unit_path="$(systemctl --property ControlGroup --value show "$service")"
+        unit_path="$(systemctl --property ControlGroup show "$service")"
+        # remove ControlGroup= from unit_path like --value would do
+        unit_path="$(printf "$unit_path" | sed 's,ControlGroup=,,')"
         # hack to fix to systemd internal cgroup escaping on slice
         unit_path="$(printf "$unit_path"|sed 's,\\x5c,\\,')"
         # get the right pidfile name
@@ -148,7 +157,7 @@ get_broken_maps() {
 # get dbus clients on the system bus
 get_dbus_names() {
     dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply \
-    /org/freedesktop/DBus org.freedesktop.DBus.ListNames|sed -rn 's/\s*string "(.*)"/\1/p'
+        /org/freedesktop/DBus org.freedesktop.DBus.ListNames|sed -rn 's/\s*string "(.*)"/\1/p'
 }
 
 # get systemd services not registered on dbus system bus
@@ -157,7 +166,11 @@ get_missing_dbus() {
     local -a registered=($(get_dbus_names))
     for service in $(get_services); do
         # get the service registered bus name
-        busname="$(systemctl --property BusName --value show "$service")"
+        # --value wasn't supported in my CentOS install yet
+        #busname="$(systemctl --property BusName --value show "$service")"
+        busname="$(systemctl --property BusName show "$service")"
+        # remove BusName= from busname like --value would do
+        busname="$(printf "$busname" | sed 's,BusName=,,')"
         if [[ "$busname" ]] && ! in_array "$busname" "${registered[@]}"; then
             echo $service
         fi
@@ -226,13 +239,13 @@ restart_services() {
 
 # reload or reexectute systemd
 reload_systemd() {
-  if grep -qF '(deleted)' /proc/1/maps; then
-    arrow 'Restart systemd'
-    systemctl --system daemon-reexec
-  else
-    arrow 'Reload systemd'
-    systemctl --system daemon-reload
-  fi
+    if grep -qF '(deleted)' /proc/1/maps; then
+        arrow 'Restart systemd'
+        systemctl --system daemon-reexec
+    else
+        arrow 'Reload systemd'
+        systemctl --system daemon-reload
+    fi
 }
 
 # display application usage and exit 2
@@ -242,9 +255,9 @@ usage() {
     echo 'options:'
     echo '  -h: this help' >&2
     echo "  -a/-A: auto confirmation (or not) (default: $AUTOCONFIRM)" >&2
+    echo "  -d/-D: call (or not) diff script before act (default: $DODIFF)" >&2
     echo "  -l/-L: call (or not) systemd daemon-(reload|reexec) (default: $RELOAD)" >&2
     echo "  -f/-F: display (or not) failed services before quit (default: $FAILED)" >&2
-    echo "  -p/-P: call (or not) pacdiff before act (default: $PACDIFF)" >&2
     echo "  -r/-R: restart (or not) services with updated files (default: $RESTART)" >&2
     echo "  -s/-S: display (or not) status of restarted service (default: $STATUS)" >&2
     echo "  -u/-U: act (or not) on services in users slice (default: $USER_SLICE)" >&2
@@ -256,12 +269,12 @@ usage() {
 # set options as global vars
 argparse() {
     local opt
-    while getopts 'AahFfLlPpRrSsUuZz' opt; do
+    while getopts 'AahDdFfLlRrSsUuZz' opt; do
         case $opt in
             A) AUTOCONFIRM=0;;      a) AUTOCONFIRM=1;;
+            D) DODIFF=0;;           d) DODIFF=1;;
             F) FAILED=0;;           f) FAILED=1;;
             L) RELOAD=0;;           l) RELOAD=1;;
-            P) PACDIFF=0;;          p) PACDIFF=1;;
             R) RESTART=0;;          r) RESTART=1;;
             S) STATUS=0;;           s) STATUS=1;;
             U) USER_SLICE=0;;       u) USER_SLICE=1;;
@@ -284,10 +297,10 @@ main() {
     # from now, we need to be root
     (( $UID != 0 )) && error 'You need to be root' && exit 1
 
-    # call pacdiff to ensure config files are updated before restart
-    if (( $PACDIFF )); then
-        arrow 'Run pacdiff'
-        pacdiff
+    # call diff script to ensure config files are updated before restart
+    if (( $DODIFF )); then
+        arrow 'Run diff script'
+        $diffscr
     fi
 
     # ensure systemd has been reloaded or reexectued
@@ -322,10 +335,10 @@ main() {
     fi
 }
 
-# disable pacdiff by default if not installed
-if  ! command -v pacdiff &> /dev/null ; then
-    warn 'skipping pacdiff as not installed'
-    PACDIFF=0
+# disable diff script by default if not installed
+if  ! command -v $diffscr &> /dev/null ; then
+    warn 'skipping diff script as not installed'
+    DODIFF=0
 fi
 
 main "$@"
